@@ -1,0 +1,16 @@
+# Claude Code session data
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Shell test artifacts
+*.bats.tap
+
+# Editor and OS
+.DS_Store
+*~
+*.swp
+*.swo

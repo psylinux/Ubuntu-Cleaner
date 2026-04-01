@@ -3,15 +3,24 @@ set -euo pipefail
 
 JOURNAL_DAYS="${JOURNAL_DAYS:-14}"
 SNAP_RETAIN="${SNAP_RETAIN:-2}"
+TMP_DAYS="${TMP_DAYS:-7}"
 
 APPLY=0
 ANALYZE=0
+QUIET=0
 INSTALL_DEPS=0
 INCLUDE_VSCODE=0
 INCLUDE_ANTIGRAVITY=0
 INCLUDE_GO=0
 INCLUDE_LOGS=0
+INCLUDE_TMP=0
+INCLUDE_DOCKER=0
+INCLUDE_FLATPAK=0
+INCLUDE_NPM=0
+INCLUDE_PIP=0
 PRUNE_DUPLICATE_EXTENSIONS=0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PRIMARY_USER=""
 PRIMARY_HOME=""
@@ -21,6 +30,7 @@ GO_BUILD_CACHE=""
 declare -a REPORT_LABELS=()
 declare -a REPORT_PATHS=()
 declare -a TOUCHED_MOUNTS=()
+declare -A TOUCHED_MOUNTS_SET=()
 declare -a REQUIRED_APT_PACKAGES=()
 declare -A BEFORE_FREE=()
 declare -A AFTER_FREE=()
@@ -40,33 +50,44 @@ Padrao:
 Opcoes:
   --apply                         Executa a limpeza.
   --apply-all                     Instala dependencias e executa a limpeza completa.
+  --dry-run                       Executa apenas analise sem remover nada (padrao).
   --analyze                       Mostra analise detalhada do filesystem.
+  --quiet                         Suprime mensagens de log; exibe apenas o sumario final.
   --install-deps                  Instala dependencias de runtime no Ubuntu local.
   --include-vscode               Inclui caches do VSCode no home do usuario.
   --include-antigravity          Inclui caches do Antigravity no home do usuario.
   --include-go                   Inclui caches do Go (go clean).
   --include-logs                 Inclui logs e crash data de editores.
+  --include-tmp                  Remove arquivos temporarios antigos de /tmp e /var/tmp.
+  --include-docker               Limpa containers parados, imagens e volumes Docker/Podman.
+  --include-flatpak              Remove apps Flatpak nao utilizados.
+  --include-npm                  Limpa caches npm/yarn/pnpm do usuario.
+  --include-pip                  Limpa cache pip do usuario.
   --prune-duplicate-extensions   Remove versoes antigas duplicadas de extensoes.
-  --journal-days N               Mantem N dias de logs do journal.
-  --snap-retain N                Mantem N revisoes de pacotes Snap.
+  --journal-days N               Mantem N dias de logs do journal (minimo 1).
+  --snap-retain N                Mantem N revisoes de pacotes Snap (minimo 1).
   --help                         Mostra esta ajuda.
 
 Variaveis de ambiente:
   JOURNAL_DAYS                   Mesmo que --journal-days.
   SNAP_RETAIN                    Mesmo que --snap-retain.
+  TMP_DAYS                       Idade minima (dias) para arquivos em /tmp serem removidos.
 
 Exemplos:
   ./ubuntu_cleaner.sh
+  ./ubuntu_cleaner.sh --dry-run
   ./ubuntu_cleaner.sh --analyze --include-vscode --include-antigravity
   sudo ./ubuntu_cleaner.sh --install-deps
   sudo ./ubuntu_cleaner.sh --apply-all
   sudo ./ubuntu_cleaner.sh --apply
   sudo ./ubuntu_cleaner.sh --apply --include-vscode --include-antigravity --prune-duplicate-extensions
   sudo ./ubuntu_cleaner.sh --apply --include-go --journal-days 7 --snap-retain 3
+  sudo ./ubuntu_cleaner.sh --apply --include-docker --include-flatpak --include-npm --include-pip
 EOF
 }
 
 log() {
+	((QUIET)) && return
 	printf '[%s] %s\n' "$(date +'%F %T')" "$*"
 }
 
@@ -126,9 +147,13 @@ add_report_target() {
 ensure_numeric_flag_value() {
 	local flag="$1"
 	local value="$2"
+	local min="${3:-0}"
 
 	if [[ -z "$value" || ! "$value" =~ ^[0-9]+$ ]]; then
 		die "Valor invalido para ${flag}: ${value:-<vazio>}"
+	fi
+	if ((value < min)); then
+		die "Valor de ${flag} deve ser >= ${min}: ${value}"
 	fi
 }
 
@@ -298,6 +323,7 @@ warn_about_running_editors() {
 print_filesystem_summary() {
 	local label="${1:-atual}"
 
+	((QUIET)) && return
 	echo "Filesystem usage (${label}):"
 	df -h -x tmpfs -x devtmpfs 2>/dev/null | sed 's/^/  /'
 	echo
@@ -366,6 +392,9 @@ print_extended_analysis() {
 
 	if [[ -n "$PRIMARY_HOME" ]]; then
 		print_dir_breakdown "Top-level de ${PRIMARY_HOME}" "$PRIMARY_HOME"
+		if [[ -d "${PRIMARY_HOME}/.cache" ]]; then
+			print_dir_breakdown "Top-level de ${PRIMARY_HOME}/.cache" "${PRIMARY_HOME}/.cache"
+		fi
 		print_large_files "$PRIMARY_HOME"
 	fi
 
@@ -375,11 +404,12 @@ print_extended_analysis() {
 	done < <(df -P -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR > 1 && $6 ~ "^/mnt/" {print $6}' | sort -u)
 }
 
+# Uses an associative array as a hash set for O(1) deduplication instead of a
+# linear scan, which matters when many paths are registered.
 register_mount_for_path() {
 	local path="$1"
 	local probe="$path"
 	local mountpoint=""
-	local existing
 
 	if [[ -z "$probe" ]]; then
 		return
@@ -398,13 +428,12 @@ register_mount_for_path() {
 		return
 	fi
 
-	for existing in "${TOUCHED_MOUNTS[@]}"; do
-		if [[ "$existing" == "$mountpoint" ]]; then
-			return
-		fi
-	done
+	if [[ -n "${TOUCHED_MOUNTS_SET[$mountpoint]+x}" ]]; then
+		return
+	fi
 
 	TOUCHED_MOUNTS+=("$mountpoint")
+	TOUCHED_MOUNTS_SET["$mountpoint"]=1
 }
 
 snapshot_mounts() {
@@ -515,12 +544,28 @@ collect_report_targets() {
 			add_report_target "Go build cache" "$GO_BUILD_CACHE"
 		fi
 	fi
+
+	if ((INCLUDE_TMP)); then
+		add_report_target "/tmp" "/tmp"
+		add_report_target "/var/tmp" "/var/tmp"
+	fi
+
+	if ((INCLUDE_NPM)) && [[ -n "$PRIMARY_HOME" ]]; then
+		add_report_target "user npm cache" "$PRIMARY_HOME/.npm"
+		add_report_target "user yarn cache" "$PRIMARY_HOME/.cache/yarn"
+		add_report_target "user pnpm store" "$PRIMARY_HOME/.cache/pnpm"
+	fi
+
+	if ((INCLUDE_PIP)) && [[ -n "$PRIMARY_HOME" ]]; then
+		add_report_target "user pip cache" "$PRIMARY_HOME/.cache/pip"
+	fi
 }
 
 register_touched_mounts() {
 	local i
 
 	TOUCHED_MOUNTS=()
+	TOUCHED_MOUNTS_SET=()
 	register_mount_for_path "/"
 	register_mount_for_path "/var/cache/apt"
 	register_mount_for_path "/var/log/journal"
@@ -541,7 +586,7 @@ register_touched_mounts() {
 
 report_candidates() {
 	local total_bytes=0
-	local i bytes autoremove_count disabled_snaps
+	local i bytes autoremove_count disabled_snaps old_kernels
 
 	echo "Targets de limpeza medidos:"
 	if [[ ${#REPORT_PATHS[@]} -eq 0 ]]; then
@@ -560,9 +605,21 @@ report_candidates() {
 		echo "Pacotes candidatos em apt autoremove: ${autoremove_count}"
 	fi
 
+	if cmd_exists dpkg && cmd_exists uname; then
+		old_kernels="$(dpkg --list 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | grep -vc "$(uname -r)" || true)"
+		echo "Kernels antigos instalados (removiveis via apt autoremove): ${old_kernels}"
+	fi
+
 	if cmd_exists snap; then
 		disabled_snaps="$(snap list --all 2>/dev/null | awk '/disabled/{count++} END{print count+0}')"
 		echo "Revisoes Snap disabled: ${disabled_snaps}"
+	fi
+
+	if ((INCLUDE_DOCKER)) && cmd_exists docker; then
+		local docker_dangling docker_stopped
+		docker_dangling="$(docker images -f "dangling=true" -q 2>/dev/null | wc -l || true)"
+		docker_stopped="$(docker ps -q -f status=exited 2>/dev/null | wc -l || true)"
+		echo "Docker imagens dangling: ${docker_dangling}, containers parados: ${docker_stopped}"
 	fi
 
 	echo "Reclaim aproximado por diretorios medidos: $(human_bytes "$total_bytes")"
@@ -584,108 +641,26 @@ report_duplicate_extensions() {
 		return
 	fi
 
-	python3 - "$PRIMARY_HOME" "$APPLY" "$PRUNE_DUPLICATE_EXTENSIONS" "$INCLUDE_VSCODE" "$INCLUDE_ANTIGRAVITY" "$ANALYZE" <<'PY'
-import re
-import shutil
-import sys
-from pathlib import Path
+	if [[ ! -f "$SCRIPT_DIR/lib/prune_extensions.py" ]]; then
+		echo "prune_extensions.py nao encontrado em ${SCRIPT_DIR}/lib/. Pulando analise."
+		echo
+		return
+	fi
 
-home = Path(sys.argv[1])
-apply = sys.argv[2] == "1"
-prune = sys.argv[3] == "1"
-include_vscode = sys.argv[4] == "1"
-include_antigravity = sys.argv[5] == "1"
-analyze = sys.argv[6] == "1"
-
-bases = []
-if include_vscode or analyze:
-    bases.append(home / ".vscode" / "extensions")
-if include_antigravity or analyze:
-    bases.extend(
-        [
-            home / ".antigravity" / "extensions",
-            home / ".antigravity-server" / "extensions",
-        ]
-    )
-
-pattern = re.compile(r"^(?P<key>.+?)-(?P<version>\d.+)$")
-
-def natural_key(value: str):
-    parts = re.split(r"(\d+)", value)
-    key = []
-    for part in parts:
-        if part.isdigit():
-            key.append((0, int(part)))
-        else:
-            key.append((1, part))
-    return key
-
-def size_bytes(path: Path) -> int:
-    total = 0
-    for item in path.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except FileNotFoundError:
-            pass
-    return total
-
-total = 0
-any_duplicates = False
-
-print("Extensoes duplicadas:")
-
-for base in bases:
-    if not base.exists():
-        continue
-
-    groups = {}
-    for child in sorted(base.iterdir()):
-        if not child.is_dir():
-            continue
-        match = pattern.match(child.name)
-        if not match:
-            continue
-        groups.setdefault(match.group("key"), []).append(child)
-
-    base_printed = False
-    for key, paths in sorted(groups.items()):
-        if len(paths) < 2:
-            continue
-
-        any_duplicates = True
-        if not base_printed:
-            print(f"  {base}")
-            base_printed = True
-
-        paths = sorted(paths, key=lambda item: natural_key(pattern.match(item.name).group("version")))
-        keep = paths[-1]
-        remove = paths[:-1]
-        print(f"    {key}")
-        print(f"      keep:   {keep.name}")
-        for candidate in remove:
-            size = size_bytes(candidate)
-            total += size
-            print(f"      remove: {candidate.name} ({size / 1024 / 1024:.1f} MiB)")
-            if apply and prune:
-                shutil.rmtree(candidate, ignore_errors=True)
-
-if not any_duplicates:
-    print("  none found")
-
-print(f"\nReclaim aproximado em extensoes duplicadas: {total / 1024 / 1024:.1f} MiB")
-
-if any_duplicates and prune and not apply:
-    print("Dry-run only: rerun with --apply --prune-duplicate-extensions to remove older duplicates.")
-PY
+	python3 "$SCRIPT_DIR/lib/prune_extensions.py" \
+		"$PRIMARY_HOME" "$APPLY" "$PRUNE_DUPLICATE_EXTENSIONS" \
+		"$INCLUDE_VSCODE" "$INCLUDE_ANTIGRAVITY" "$ANALYZE"
 	echo
 }
 
+# Removes only the immediate children of a directory so that find does not
+# attempt to delete already-removed descendants, and preserves the parent
+# directory itself (keeping its permissions intact).
 clear_directory() {
 	local path="$1"
 
 	if [[ -d "$path" ]]; then
-		find "$path" -mindepth 1 -xdev -exec rm -rf -- {} + 2>/dev/null || true
+		find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
 	fi
 }
 
@@ -702,8 +677,8 @@ reset_owned_directory() {
 	local owner="$2"
 	local group="$3"
 
-	rm -rf -- "$path"
-	install -d -o "$owner" -g "$group" "$path"
+	rm -rf -- "$path" || die "Falha ao remover ${path}"
+	install -d -o "$owner" -g "$group" -- "$path"
 }
 
 clean_apt() {
@@ -804,6 +779,66 @@ clean_primary_user_trash_and_thumbs() {
 	fi
 }
 
+clean_tmp() {
+	if ((!INCLUDE_TMP)); then
+		return
+	fi
+
+	log "Limpando arquivos temporarios com mais de ${TMP_DAYS} dias em /tmp e /var/tmp"
+	find /tmp -mindepth 1 -maxdepth 1 -atime +"${TMP_DAYS}" -exec rm -rf -- {} + 2>/dev/null || true
+	find /var/tmp -mindepth 1 -maxdepth 1 -atime +"${TMP_DAYS}" -exec rm -rf -- {} + 2>/dev/null || true
+}
+
+clean_docker() {
+	if ((!INCLUDE_DOCKER)); then
+		return
+	fi
+
+	if cmd_exists docker; then
+		log "Limpando Docker: containers parados, imagens dangling e volumes sem uso"
+		docker system prune -f || true
+	elif cmd_exists podman; then
+		log "Limpando Podman: containers parados, imagens dangling e volumes sem uso"
+		podman system prune -f || true
+	else
+		log "docker/podman nao encontrado. Pulando limpeza de containers."
+	fi
+}
+
+clean_flatpak() {
+	if ((!INCLUDE_FLATPAK)); then
+		return
+	fi
+
+	if ! cmd_exists flatpak; then
+		log "flatpak nao encontrado. Pulando limpeza do Flatpak."
+		return
+	fi
+
+	log "Removendo apps Flatpak nao utilizados"
+	flatpak uninstall --unused -y || true
+}
+
+clean_user_npm_cache() {
+	if ((!INCLUDE_NPM)) || [[ -z "$PRIMARY_USER" || -z "$PRIMARY_HOME" ]]; then
+		return
+	fi
+
+	log "Limpando caches npm/yarn/pnpm do usuario ${PRIMARY_USER}"
+	clear_directory "${PRIMARY_HOME}/.npm"
+	clear_directory "${PRIMARY_HOME}/.cache/yarn"
+	clear_directory "${PRIMARY_HOME}/.cache/pnpm"
+}
+
+clean_user_pip_cache() {
+	if ((!INCLUDE_PIP)) || [[ -z "$PRIMARY_USER" || -z "$PRIMARY_HOME" ]]; then
+		return
+	fi
+
+	log "Limpando cache pip do usuario ${PRIMARY_USER}"
+	clear_directory "${PRIMARY_HOME}/.cache/pip"
+}
+
 clean_vscode_caches() {
 	local base="${PRIMARY_HOME}/.config/Code"
 
@@ -888,10 +923,21 @@ parse_args() {
 			INCLUDE_ANTIGRAVITY=1
 			INCLUDE_GO=1
 			INCLUDE_LOGS=1
+			INCLUDE_TMP=1
+			INCLUDE_DOCKER=1
+			INCLUDE_FLATPAK=1
+			INCLUDE_NPM=1
+			INCLUDE_PIP=1
 			PRUNE_DUPLICATE_EXTENSIONS=1
+			;;
+		--dry-run)
+			APPLY=0
 			;;
 		--analyze)
 			ANALYZE=1
+			;;
+		--quiet)
+			QUIET=1
 			;;
 		--install-deps)
 			INSTALL_DEPS=1
@@ -908,17 +954,32 @@ parse_args() {
 		--include-logs)
 			INCLUDE_LOGS=1
 			;;
+		--include-tmp)
+			INCLUDE_TMP=1
+			;;
+		--include-docker)
+			INCLUDE_DOCKER=1
+			;;
+		--include-flatpak)
+			INCLUDE_FLATPAK=1
+			;;
+		--include-npm)
+			INCLUDE_NPM=1
+			;;
+		--include-pip)
+			INCLUDE_PIP=1
+			;;
 		--prune-duplicate-extensions)
 			PRUNE_DUPLICATE_EXTENSIONS=1
 			;;
 		--journal-days)
 			shift
-			ensure_numeric_flag_value "--journal-days" "${1:-}"
+			ensure_numeric_flag_value "--journal-days" "${1:-}" 1
 			JOURNAL_DAYS="$1"
 			;;
 		--snap-retain)
 			shift
-			ensure_numeric_flag_value "--snap-retain" "${1:-}"
+			ensure_numeric_flag_value "--snap-retain" "${1:-}" 1
 			SNAP_RETAIN="$1"
 			;;
 		--help | -h)
@@ -963,6 +1024,11 @@ main() {
 		exit 0
 	fi
 
+	if ((INCLUDE_LOGS)); then
+		echo "Aviso: --include-logs ativo. Logs de crash e editor serao removidos permanentemente."
+		echo
+	fi
+
 	log "Iniciando limpeza"
 	clean_apt
 	clean_journal
@@ -971,6 +1037,11 @@ main() {
 	restart_snapd
 	clean_root_caches
 	clean_primary_user_trash_and_thumbs
+	clean_tmp
+	clean_docker
+	clean_flatpak
+	clean_user_npm_cache
+	clean_user_pip_cache
 	clean_vscode_caches
 	clean_antigravity_caches
 	clean_go_caches
